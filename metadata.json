@@ -1,0 +1,8 @@
+{
+  "name": "Jaago AI",
+  "description": "An intelligent alarm clock that forces you to wake up using Gemini-powered challenges.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
