@@ -414,7 +414,106 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
     setIsRecording(false);
   };
 
-  // --- Steps Logic ---
+  // --- Steps Logic (Location Based) ---
+  const accumulatedDistanceRef = useRef<number>(0);
+  const lastPositionRef = useRef<{lat: number, lng: number} | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const [locationPermissionGranted, setLocationPermissionGranted] = useState<boolean | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+
+  // Haversine formula to calculate distance between two coordinates in meters
+  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+    const R = 6371e3; // Earth radius in meters
+    const toRad = (value: number) => value * Math.PI / 180;
+    const φ1 = toRad(lat1);
+    const φ2 = toRad(lat2);
+    const Δφ = toRad(lat2 - lat1);
+    const Δλ = toRad(lon2 - lon1);
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
+  };
+
+  const startLocationTracking = () => {
+    if (!("geolocation" in navigator)) {
+      setLocationError("Geolocation is not supported by your browser.");
+      return;
+    }
+
+    setLocationError(null);
+    setLocationPermissionGranted(true);
+
+    watchIdRef.current = navigator.geolocation.watchPosition(
+      (position) => {
+        const { latitude, longitude, accuracy } = position.coords;
+        
+        // Ignore highly inaccurate readings (e.g., > 20 meters off)
+        if (accuracy > 20) return;
+
+        if (lastPositionRef.current) {
+          const dist = calculateDistance(
+            lastPositionRef.current.lat,
+            lastPositionRef.current.lng,
+            latitude,
+            longitude
+          );
+
+          // Only count if distance is reasonable (e.g., > 0.5m to avoid GPS drift jitter)
+          if (dist > 0.5 && dist < 50) { 
+            accumulatedDistanceRef.current += dist;
+            
+            // Average step length is ~0.762 meters
+            const newSteps = Math.floor(accumulatedDistanceRef.current / 0.762);
+            
+            setSteps(prev => {
+              if (newSteps > prev) {
+                 if (newSteps >= targetSteps) {
+                   setTimeout(handleNext, 500);
+                 }
+                 return newSteps;
+              }
+              return prev;
+            });
+          }
+        }
+        
+        lastPositionRef.current = { lat: latitude, lng: longitude };
+      },
+      (error) => {
+        console.error(error);
+        if (error.code === error.PERMISSION_DENIED) {
+            setLocationError("Location access denied. Please allow location access to track steps.");
+            setLocationPermissionGranted(false);
+        } else {
+            setLocationError(`Location error: ${error.message}`);
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 0,
+        timeout: 5000
+      }
+    );
+  };
+
+  useEffect(() => {
+    if (currentTask !== TaskType.WALK_STEPS) {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    }
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
+  }, [currentTask]);
+
   const incrementSteps = () => {
       setSteps(prev => {
           const next = prev + 1;
@@ -692,21 +791,44 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
         {/* STEPS UI */}
         {currentTask === TaskType.WALK_STEPS && (
             <div className="space-y-6 text-center">
-                <div className="w-40 h-40 mx-auto rounded-full border-8 border-zinc-800 flex items-center justify-center relative bg-zinc-950">
-                    <span className="text-5xl font-black text-white">{steps}</span>
-                    <span className="text-xs text-zinc-500 absolute bottom-8 font-bold tracking-widest">/ {targetSteps}</span>
+                {locationError && (
+                    <div className="w-full mb-4 p-3 bg-red-900/20 border border-red-500/50 text-red-200 text-xs rounded-lg text-left">
+                        {locationError}
+                    </div>
+                )}
+                
+                <div className="w-48 h-48 mx-auto rounded-full border-8 border-zinc-800 flex flex-col items-center justify-center relative bg-zinc-950">
+                    <span className="text-6xl font-black text-white">{steps}</span>
+                    <span className="text-xs text-zinc-500 font-bold tracking-widest mt-1">/ {targetSteps} STEPS</span>
+                    <span className="text-sm text-indigo-400 font-bold mt-2">{(steps * 0.000762).toFixed(3)} KM</span>
                 </div>
                 <div className="space-y-2">
                     <h3 className="text-xl font-bold text-white">Get Moving!</h3>
-                    <p className="text-zinc-400 text-sm">Walk around with your device. <br/><span className="text-xs text-zinc-600">(Or simulate by tapping below)</span></p>
+                    <p className="text-zinc-400 text-sm">Walk around with your device. GPS location is used to track your movement.</p>
                 </div>
-                <button 
-                    onClick={incrementSteps}
-                    className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 text-white font-bold rounded-xl flex items-center justify-center gap-2 shadow-lg transition-transform active:scale-95"
-                >
-                    <Activity className="w-5 h-5" />
-                    Simulate Step
-                </button>
+                
+                {!locationPermissionGranted ? (
+                    <button 
+                        onClick={startLocationTracking}
+                        className="w-full py-4 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl flex items-center justify-center gap-2 shadow-lg transition-transform active:scale-95"
+                    >
+                        <Activity className="w-5 h-5" />
+                        Enable Location Tracking
+                    </button>
+                ) : (
+                    <div className="flex flex-col gap-2">
+                        <div className="w-full py-3 bg-zinc-800/50 text-zinc-400 text-sm rounded-xl flex items-center justify-center gap-2 border border-zinc-800">
+                            <Activity className="w-4 h-4 animate-pulse text-indigo-400" />
+                            Tracking location...
+                        </div>
+                        <button 
+                            onClick={incrementSteps}
+                            className="w-full py-3 bg-zinc-900 hover:bg-zinc-800 text-zinc-600 hover:text-zinc-400 font-bold rounded-xl flex items-center justify-center gap-2 transition-transform active:scale-95 text-xs"
+                        >
+                            Simulate Step (Manual Tap)
+                        </button>
+                    </div>
+                )}
             </div>
         )}
       </div>
