@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { Persona, TaskType } from '../types';
-import { verifyAwakeFace, verifySpeech, getReadingChallenge, verifyQRCodeOrObject } from '../services/geminiService';
+import { verifyAwakeFace, verifySpeech, getReadingChallenge, verifyQRCodeOrObject, countChants } from '../services/geminiService';
 import { Loader2, Camera, Mic, Activity, XCircle, Zap, Volume2, Hand, Settings, Ear, CheckCircle2, XCircle as XIcon } from 'lucide-react';
 
 interface TaskFlowProps {
@@ -30,12 +30,7 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
   // Chanting State
   const [chantCount, setChantCount] = useState(0);
   const TARGET_CHANTS = 108;
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const chantAudioContextRef = useRef<AudioContext | null>(null);
-  const lastNoiseTimeRef = useRef<number>(0);
   const isChantingRef = useRef(false);
-  const recognitionRef = useRef<any>(null); // For SpeechRecognition
-  const [currentVol, setCurrentVol] = useState(0); // For Visualizer
   const [manualMode, setManualMode] = useState(false);
   const [lastHeard, setLastHeard] = useState<{text: string, valid: boolean} | null>(null); // Feedback for user
   
@@ -62,7 +57,6 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
       setCapturedImage(null);
       setIsRecording(false);
       setChantCount(0);
-      setCurrentVol(0);
       setManualMode(false);
       setManualTapCount(0);
       setCameraActive(false); // Reset camera UI
@@ -105,24 +99,15 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
   // --- Chanting Logic (Real-time Speech Recognition) ---
   
   const cleanupChantAudio = () => {
-    if (chantAudioContextRef.current) {
-        chantAudioContextRef.current.close();
-        chantAudioContextRef.current = null;
-    }
-    if (recognitionRef.current) {
-        recognitionRef.current.stop();
-        recognitionRef.current = null;
-    }
+    // No longer needed for Gemini implementation, kept for compatibility with existing useEffect
     isChantingRef.current = false;
   };
 
-  const startChantingSession = async () => {
+  const startChantRecording = async () => {
     setError(null);
     setManualMode(false);
-    setChantCount(0);
     setLastHeard(null);
     
-    // 1. Setup Volume Detection (For Alarm Control)
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         setError("Microphone not supported. Switching to Manual Mode.");
         setManualMode(true);
@@ -130,125 +115,61 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
     }
 
     try {
-        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-        const ctx = new AudioContextClass();
-        chantAudioContextRef.current = ctx;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      audioChunksRef.current = [];
 
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        
-        if (ctx.state === 'suspended') {
-            await ctx.resume();
-        }
+      mediaRecorder.ondataavailable = (event) => {
+        audioChunksRef.current.push(event.data);
+      };
 
-        const source = ctx.createMediaStreamSource(stream);
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 256;
-        source.connect(analyser);
-        analyserRef.current = analyser;
+      mediaRecorder.onstop = async () => {
+        setLoading(true);
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
+        const reader = new FileReader();
+        reader.readAsDataURL(audioBlob);
+        reader.onloadend = async () => {
+          const base64Audio = reader.result as string;
+          const result = await countChants(base64Audio);
+          setLoading(false);
+          
+          if (result.count > 0) {
+              setChantCount(prev => {
+                  const newCount = Math.min(prev + result.count, TARGET_CHANTS);
+                  if (newCount >= TARGET_CHANTS) {
+                      setTimeout(handleNext, 1000);
+                  }
+                  return newCount;
+              });
+              setLastHeard({ text: `Counted ${result.count} chants!`, valid: true });
+          } else {
+              setLastHeard({ text: result.message || "No chants detected.", valid: false });
+          }
+          
+          if (onUnmuteAlarm) onUnmuteAlarm();
+        };
+      };
 
-        // 2. Setup Speech Recognition (For Counting)
-        const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-        
-        if (SpeechRecognition) {
-            const recognition = new SpeechRecognition();
-            recognition.continuous = true;
-            // False = only return final results. This prevents double counting and improves accuracy.
-            recognition.interimResults = false; 
-            recognition.lang = 'hi-IN'; // Optimized for Hindi names
-
-            recognition.onresult = (event: any) => {
-                for (let i = event.resultIndex; i < event.results.length; ++i) {
-                    if (event.results[i].isFinal) {
-                        const transcript = event.results[i][0].transcript.toLowerCase().trim();
-                        
-                        // Strict Regex: Only Radha/Radhe variations allowed
-                        // Removed Krishna, Hare, Govinda etc. to satisfy "sirf radha name hi detect krna"
-                        const regex = /(radha|radhe|rada|raadha|राधा|राधे)/g;
-                        const found = transcript.match(regex);
-                        const matches = (found || []).length;
-                        
-                        if (matches > 0) {
-                             // If multiple matches in one phrase, count them all
-                             // e.g. "Radha Radha" -> 2
-                            setLastHeard({ text: found!.join(' '), valid: true }); 
-                            setChantCount(prev => Math.min(prev + matches, TARGET_CHANTS));
-                        } else {
-                            // Feedback for ignored words
-                            setLastHeard({ text: transcript, valid: false });
-                        }
-                    }
-                }
-            };
-            
-            recognition.onerror = (e: any) => {
-                console.warn("Speech recognition error", e);
-                // Don't error out completely, user can still see volume visualizer
-            };
-
-            recognition.onend = () => {
-                // Auto-restart if task not done
-                if (isChantingRef.current && chantCount < TARGET_CHANTS) {
-                    try { recognition.start(); } catch(e) {}
-                }
-            };
-
-            recognitionRef.current = recognition;
-            recognition.start();
-        } else {
-            setError("Speech Recognition not supported in this browser. Please use Chrome.");
-        }
-
-        setIsRecording(true);
-        isChantingRef.current = true;
-        lastNoiseTimeRef.current = Date.now();
-        
-        // Mute alarm immediately when starting
-        if(onMuteAlarm) onMuteAlarm();
-
-        requestAnimationFrame(detectChantPeak);
-
+      mediaRecorder.start();
+      setIsRecording(true);
+      if (onMuteAlarm) onMuteAlarm();
     } catch (err: any) {
-        console.error("Chanting Setup Error:", err);
-        setManualMode(true);
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.message?.includes('Permission denied')) {
-            setError("Microphone permission denied. Please allow microphone access in your browser settings. Switched to Manual Mode.");
-        } else {
-            setError(`Microphone error: ${err.message}. Switched to Manual Mode.`);
-        }
+      console.error("Mic Error:", err);
+      setManualMode(true);
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError' || err.message?.includes('Permission denied')) {
+          setError("Microphone permission denied. Switched to Manual Mode.");
+      } else {
+          setError("Could not access microphone. Switched to Manual Mode.");
+      }
     }
   };
 
-  const detectChantPeak = () => {
-    if (!isChantingRef.current || !analyserRef.current) return;
-
-    const bufferLength = analyserRef.current.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    analyserRef.current.getByteFrequencyData(dataArray);
-
-    let sum = 0;
-    for (let i = 0; i < bufferLength; i++) {
-        sum += dataArray[i];
+  const stopChantRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+        mediaRecorderRef.current.stop();
     }
-    const average = sum / bufferLength;
-    setCurrentVol(average); 
-
-    const now = Date.now();
-    
-    // Smart Alarm Logic:
-    // If volume > 15 (user is chanting/making noise), mute alarm.
-    // If silence for > 2 seconds, unmute alarm (punishment).
-    if (average > 15) {
-        lastNoiseTimeRef.current = now;
-        if (onMuteAlarm) onMuteAlarm(); 
-    } else {
-        if (now - lastNoiseTimeRef.current > 2000) {
-            if (onUnmuteAlarm) onUnmuteAlarm();
-        }
-    }
-
-    if (isChantingRef.current) {
-        requestAnimationFrame(detectChantPeak);
-    }
+    setIsRecording(false);
   };
 
   const handleManualChantTap = () => {
@@ -260,8 +181,6 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
           }
           return newCount;
       });
-      setCurrentVol(50);
-      setTimeout(() => setCurrentVol(0), 100);
   };
 
   // --- Camera Logic ---
@@ -564,53 +483,36 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
         {/* CHANTING UI */}
         {currentTask === TaskType.CHANTING && (
           <div className="space-y-8 text-center">
-             <div className="relative">
-                <div 
-                    className="absolute inset-0 rounded-full border border-amber-500/30 transition-all duration-100 ease-out"
-                    style={{ 
-                        transform: `scale(${1 + (currentVol / 100)})`,
-                        opacity: (isRecording || manualMode) ? 0.5 : 0 
-                    }}
-                />
-                
-                <div className="w-40 h-40 mx-auto rounded-full border-8 border-zinc-800 flex items-center justify-center relative overflow-hidden bg-zinc-950 z-10">
-                    <div 
-                        className="absolute bottom-0 w-full bg-amber-500/20 transition-all duration-300 ease-linear"
-                        style={{ height: `${(chantCount / TARGET_CHANTS) * 100}%` }}
-                    />
-                    <div className="relative z-10 flex flex-col items-center">
-                        <span className="text-5xl font-black text-white">{chantCount}</span>
-                        <span className="text-xs text-zinc-500 uppercase mt-1">/ {TARGET_CHANTS}</span>
-                    </div>
-                </div>
+             <div className="w-40 h-40 mx-auto rounded-full border-8 border-zinc-800 flex items-center justify-center relative overflow-hidden bg-zinc-950 z-10">
+                 <div 
+                     className="absolute bottom-0 w-full bg-amber-500/20 transition-all duration-300 ease-linear"
+                     style={{ height: `${(chantCount / TARGET_CHANTS) * 100}%` }}
+                 />
+                 <div className="relative z-10 flex flex-col items-center">
+                     <span className="text-5xl font-black text-white">{chantCount}</span>
+                     <span className="text-xs text-zinc-500 uppercase mt-1">/ {TARGET_CHANTS}</span>
+                 </div>
              </div>
 
              <div className="space-y-2">
                  <h2 className="text-2xl font-bold text-white">Chant "Radha"</h2>
-                 <p className="text-zinc-400 text-sm max-w-[200px] mx-auto">
+                 <p className="text-zinc-400 text-sm max-w-[250px] mx-auto">
                     {manualMode 
                         ? "Microphone unavailable. Tap button repeatedly."
-                        : (isRecording ? "Listening & Verifying..." : "Press start and chant 'Radha' clearly.")
+                        : "Hold the button and chant multiple times. Release to verify."
                     }
                  </p>
-                 {!manualMode && isRecording && (
-                    <div className="flex flex-col gap-2 items-center">
-                        <p className="text-xs text-red-400 font-medium animate-pulse">
-                            Alarm resumes if you stop.
-                        </p>
-                        {lastHeard && (
-                             <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold ${
-                                 lastHeard.valid ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-red-900/30 text-red-400 border border-red-800'
-                             }`}>
-                                {lastHeard.valid ? <CheckCircle2 className="w-3 h-3" /> : <XIcon className="w-3 h-3" />}
-                                <span>Heard: "{lastHeard.text}"</span>
-                             </div>
-                        )}
-                    </div>
+                 {lastHeard && (
+                     <div className={`mt-2 inline-flex items-center gap-2 px-3 py-1 rounded-full text-xs font-bold ${
+                         lastHeard.valid ? 'bg-green-900/30 text-green-400 border border-green-800' : 'bg-red-900/30 text-red-400 border border-red-800'
+                     }`}>
+                        {lastHeard.valid ? <CheckCircle2 className="w-3 h-3" /> : <XIcon className="w-3 h-3" />}
+                        <span>{lastHeard.text}</span>
+                     </div>
                  )}
              </div>
 
-             <div className="flex flex-col gap-3">
+             <div className="flex flex-col gap-3 w-full items-center">
                  {manualMode ? (
                      <button
                         onClick={handleManualChantTap}
@@ -620,35 +522,51 @@ export const TaskFlow: React.FC<TaskFlowProps> = ({ persona, tasks, onComplete, 
                         Tap to Chant ({chantCount})
                      </button>
                  ) : (
-                     !isRecording ? (
+                     <div className="space-y-6 w-full flex flex-col items-center">
+                         <p className="text-zinc-500 text-xs uppercase tracking-widest font-bold flex items-center gap-2">
+                            {isRecording ? <span className="flex h-2 w-2 rounded-full bg-red-500 animate-ping"/> : null}
+                            {isRecording ? "Recording Active..." : "Hold Button & Chant"}
+                         </p>
+
                          <button 
-                            onClick={startChantingSession}
-                            className="w-full py-4 bg-zinc-800 hover:bg-zinc-700 text-white font-bold rounded-xl flex items-center justify-center gap-2 transition-all"
+                            onMouseDown={startChantRecording}
+                            onMouseUp={stopChantRecording}
+                            onTouchStart={(e) => { e.preventDefault(); startChantRecording(); }}
+                            onTouchEnd={(e) => { e.preventDefault(); stopChantRecording(); }}
+                            onContextMenu={(e) => e.preventDefault()}
+                            disabled={loading || chantCount >= TARGET_CHANTS}
+                            className={`
+                                relative w-36 h-36 rounded-full flex items-center justify-center transition-all duration-200 select-none touch-none
+                                ${isRecording 
+                                    ? 'bg-amber-500 scale-110 shadow-[0_0_50px_rgba(245,158,11,0.5)] border-4 border-amber-400' 
+                                    : 'bg-zinc-800 hover:bg-zinc-700 hover:scale-105 shadow-xl border-4 border-zinc-700'
+                                }
+                                ${loading || chantCount >= TARGET_CHANTS ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer active:scale-95'}
+                            `}
                          >
-                            <Mic className="w-5 h-5" />
-                            Start Chanting
-                         </button>
-                     ) : (
-                        <button 
-                            disabled={chantCount < TARGET_CHANTS}
-                            onClick={handleNext}
-                            className={`w-full py-4 font-bold rounded-xl flex items-center justify-center gap-2 transition-all ${
-                                chantCount >= TARGET_CHANTS 
-                                ? 'bg-green-600 hover:bg-green-500 text-white shadow-lg shadow-green-500/20' 
-                                : 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
-                            }`}
-                        >
-                            {chantCount >= TARGET_CHANTS ? (
-                                <>
-                                    <Zap className="w-5 h-5" /> Finish Task
-                                </>
-                            ) : (
-                                <>
-                                    <Volume2 className="w-5 h-5" /> {TARGET_CHANTS - chantCount} Remaining...
-                                </>
+                            {isRecording && (
+                                <div className="absolute inset-0 rounded-full border border-white/50 animate-ping duration-1000" />
                             )}
-                        </button>
-                     )
+                            
+                            {loading ? (
+                                <Loader2 className="animate-spin w-12 h-12 text-white/50" /> 
+                            ) : chantCount >= TARGET_CHANTS ? (
+                                <CheckCircle2 className="w-12 h-12 text-green-500" />
+                            ) : (
+                                <Mic className={`w-12 h-12 ${isRecording ? 'text-white' : 'text-zinc-400'} transition-colors`} />
+                            )}
+                         </button>
+
+                         {isRecording ? (
+                            <p className="text-amber-400 text-sm animate-pulse font-medium">
+                                Release button to verify count
+                            </p>
+                         ) : (
+                            <p className="text-zinc-600 text-sm">
+                                Alarm is muted while holding.
+                            </p>
+                         )}
+                     </div>
                  )}
              </div>
           </div>

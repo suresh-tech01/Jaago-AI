@@ -6,11 +6,9 @@ const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
 // gemini-3-flash-preview supports text, images, and audio.
 const MODEL_NAME = 'gemini-3-flash-preview';
 
-export const verifyChanting = async (audioBase64: string): Promise<{ passed: boolean; message: string }> => {
+export const countChants = async (audioBase64: string): Promise<{ count: number; message: string }> => {
   try {
-    const prompt = `Listen to this audio. Is the person chanting the name "Radha" or "Radhe" repeatedly? 
-    It is a wake-up task. They must be saying it clearly.
-    Return JSON: { "passed": true/false, "message": "feedback" }`;
+    const prompt = `Listen to this audio. Count exactly how many times the person clearly says the word "Radha" or "Radhe". Return JSON: { "count": number, "message": "short feedback" }`;
     
     // Extract mime type dynamically
     const mimeMatch = audioBase64.match(/^data:(audio\/[a-zA-Z0-9.-]+);base64,/);
@@ -30,7 +28,7 @@ export const verifyChanting = async (audioBase64: string): Promise<{ passed: boo
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            passed: { type: Type.BOOLEAN },
+            count: { type: Type.INTEGER },
             message: { type: Type.STRING }
           }
         }
@@ -39,12 +37,12 @@ export const verifyChanting = async (audioBase64: string): Promise<{ passed: boo
 
     const result = JSON.parse(response.text || "{}");
     return {
-      passed: result.passed ?? false,
-      message: result.message || "Could not verify chant."
+      count: result.count ?? 0,
+      message: result.message || "Processed audio."
     };
   } catch (error) {
-    console.error("Chant Verification Error:", error);
-    return { passed: false, message: "Error verifying audio." };
+    console.error("Chant Count Error:", error);
+    return { count: 0, message: "Error processing audio." };
   }
 };
 
